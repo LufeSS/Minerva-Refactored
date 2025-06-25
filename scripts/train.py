@@ -1,4 +1,4 @@
-import math
+git import math
 import json
 import random
 from pathlib import Path
@@ -15,8 +15,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
-from minerva_legacy.data.wikitext import build_dataloader, load_wikitext
-from minerva_legacy.model import Decoder
+from minerva.data.wikitext import build_dataloader, load_wikitext
+from minerva.model import Decoder
 
 console = Console()
 

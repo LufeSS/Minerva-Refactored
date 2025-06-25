@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from minerva_legacy.model import Decoder
+from minerva.model import Decoder
 
 
 @pytest.fixture
