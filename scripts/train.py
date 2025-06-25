@@ -1,7 +1,10 @@
 import math
+import json
+import random
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import typer
@@ -12,8 +15,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
-from minerva.data.wikitext import build_dataloader, load_wikitext
-from minerva.model import Decoder
+from minerva_legacy.data.wikitext import build_dataloader, load_wikitext
+from minerva_legacy.model import Decoder
 
 console = Console()
 
@@ -43,7 +46,8 @@ class TrainerConfig(BaseSettings):
     checkpoint_dir: str = "checkpoints"
 
 
-def shift_labels(inputs: torch.Tensor):
+def shift_labels(inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return *inputs[:-1]* as model input and *inputs[1:]* as labels."""
     return inputs[:, :-1].contiguous(), inputs[:, 1:].contiguous()
 
 
@@ -65,27 +69,36 @@ def main(
     checkpoint_dir: str = typer.Option("checkpoints", help="Checkpoint directory."),
 ):
     """Train Minerva on a given dataset."""
+    # ---------------- Seed everything for reproducibility ---------------- #
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     if config_file:
         config = TrainerConfig(_env_file=config_file)
     else:
-        # This feels a bit repetitive, there might be a better way to do this with Typer/Pydantic
-        config = TrainerConfig(
-            seq_len=seq_len,
-            batch_size=batch_size,
-            epochs=epochs,
-            lr=lr,
-            num_layers=num_layers,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            grad_accum=grad_accum,
-            warmup_ratio=warmup_ratio,
-            dataset=dataset,
-            checkpoint_dir=checkpoint_dir,
-        )
+        # Collect local CLI args that intersect TrainerConfig fields
+        local_kwargs = {
+            k: v
+            for k, v in locals().items()
+            if k in TrainerConfig.model_fields
+        }
+        config = TrainerConfig(**local_kwargs)
 
     device = torch.device(config.device)
     console.print(f"Using device: [bold]{device}[/bold]")
+
+    # ---------------- FlashAttention availability check ------------------ #
+    if torch.cuda.is_available():
+        try:
+            from torch.backends.cuda import sdp_kernel, SdpKernel
+
+            if sdp_kernel() == SdpKernel.NONE:
+                console.print("[yellow]FlashAttention kernels not available. Falling back to standard scaled_dot_product_attention.[/yellow]")
+        except Exception:  # pragma: no cover
+            console.print("[yellow]Could not determine FlashAttention support (PyTorch <2.1?).[/yellow]")
 
     # --- Dataset Loading ---
     console.print(
@@ -128,6 +141,18 @@ def main(
     ckpt_dir = Path(config.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---------------- Save config for reproducibility -------------------- #
+    with open(ckpt_dir / "trainer_config.json", "w", encoding="utf-8") as f:
+        json.dump(config.model_dump(), f, indent=2)
+
+    # ---------------- AMP / GradScaler setup ----------------------------- #
+    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    if device.type == "cuda":
+        scaler = torch.cuda.amp.GradScaler()
+
+    # Ensure gradients are None before starting
+    optimizer.zero_grad(set_to_none=True)
+
     # --- Training Loop ---
     for epoch in range(1, config.epochs + 1):
         # ... training ...
@@ -141,23 +166,37 @@ def main(
             input_ids = batch["input_ids"].to(device)
             inp, tgt = shift_labels(input_ids)
 
-            logits = model(inp)
-            ce_loss_sum = F.cross_entropy(
-                logits.view(-1, vocab_size), tgt.view(-1), reduction="sum"
-            )
+            # Automatic Mixed Precision forward & loss
+            with torch.cuda.amp.autocast(enabled=scaler is not None):
+                logits = model(inp)
+                ce_loss_sum = F.cross_entropy(
+                    logits.view(-1, vocab_size), tgt.view(-1), reduction="sum"
+                )
 
             tokens_in_batch = tgt.numel()
             running_nll += ce_loss_sum.item()
             total_tokens += tokens_in_batch
 
             avg_loss = ce_loss_sum / tokens_in_batch
-            (avg_loss / config.grad_accum).backward()
+
+            loss_for_accum = avg_loss / config.grad_accum
+            if scaler is not None:
+                scaler.scale(loss_for_accum).backward()
+            else:
+                loss_for_accum.backward()
 
             if (step_in_epoch + 1) % config.grad_accum == 0:
-                # --- Clip gradients to prevent explosion ---
+                # --- Clip & Optimizer step with GradScaler support ---
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
+
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             
