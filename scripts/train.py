@@ -154,6 +154,9 @@ def main(
             (avg_loss / config.grad_accum).backward()
 
             if (step_in_epoch + 1) % config.grad_accum == 0:
+                # --- Clip gradients to prevent explosion ---
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
