@@ -110,8 +110,8 @@ def main(
     val_ds, _, _ = load_wikitext(
         "validation", block_size=config.seq_len, dataset_variant=config.dataset
     )
-    train_loader = build_dataloader(train_ds, config.batch_size, shuffle=True)
-    val_loader = build_dataloader(val_ds, config.batch_size, shuffle=False)
+    train_loader = build_dataloader(train_ds, batch_size=config.batch_size, shuffle=True)
+    val_loader = build_dataloader(val_ds, batch_size=config.batch_size, shuffle=False)
 
     # --- Model Initialization ---
     console.print("Building model…")
