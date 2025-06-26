@@ -49,4 +49,10 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 pretty = true
-exclude = ["scripts/"] 
+exclude = ["scripts/"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"] 
